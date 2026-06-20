@@ -22,6 +22,20 @@ app.use((req, res, next) => {
   next();
 });
 
+const VALID_SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"];
+
+function parseSeverityFilter(severity) {
+  if (!severity || typeof severity !== "string") return null;
+  const parts = severity
+    .split(",")
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+  if (parts.length === 0) return null;
+  const valid = parts.filter((s) => VALID_SEVERITIES.includes(s));
+  if (valid.length === 0) return null;
+  return valid;
+}
+
 function sanitizeImageName(name) {
   if (!name || typeof name !== "string") return null;
   const trimmed = name.trim();
@@ -157,7 +171,7 @@ function getSeveritySummary(vulnerabilities) {
 }
 
 app.post("/scan", async (req, res) => {
-  const { image } = req.body;
+  const { image, severity } = req.body;
 
   const imageName = sanitizeImageName(image);
   if (!imageName) {
@@ -167,15 +181,21 @@ app.post("/scan", async (req, res) => {
     });
   }
 
+  const severityFilter = parseSeverityFilter(severity);
+
   try {
     const trivyResult = await runTrivy(imageName);
-    const vulnerabilities = extractVulnerabilities(trivyResult);
+    const allVulnerabilities = extractVulnerabilities(trivyResult);
+    const vulnerabilities = severityFilter
+      ? allVulnerabilities.filter((v) => severityFilter.includes((v.severity || "UNKNOWN").toUpperCase()))
+      : allVulnerabilities;
     const severitySummary = getSeveritySummary(vulnerabilities);
 
     res.json({
       success: true,
       image: imageName,
       totalVulnerabilities: vulnerabilities.length,
+      severityFilter: severityFilter || null,
       severitySummary,
       vulnerabilities,
     });
@@ -191,6 +211,7 @@ app.post("/scan", async (req, res) => {
 
 app.get("/scan", async (req, res) => {
   const image = req.query.image;
+  const severity = req.query.severity;
 
   const imageName = sanitizeImageName(image);
   if (!imageName) {
@@ -200,15 +221,21 @@ app.get("/scan", async (req, res) => {
     });
   }
 
+  const severityFilter = parseSeverityFilter(severity);
+
   try {
     const trivyResult = await runTrivy(imageName);
-    const vulnerabilities = extractVulnerabilities(trivyResult);
+    const allVulnerabilities = extractVulnerabilities(trivyResult);
+    const vulnerabilities = severityFilter
+      ? allVulnerabilities.filter((v) => severityFilter.includes((v.severity || "UNKNOWN").toUpperCase()))
+      : allVulnerabilities;
     const severitySummary = getSeveritySummary(vulnerabilities);
 
     res.json({
       success: true,
       image: imageName,
       totalVulnerabilities: vulnerabilities.length,
+      severityFilter: severityFilter || null,
       severitySummary,
       vulnerabilities,
     });
@@ -229,7 +256,8 @@ app.get("/health", (_req, res) => {
 app.listen(PORT, () => {
   console.log(`镜像安全扫描服务已启动：http://localhost:${PORT}`);
   console.log(`扫描超时限制：${SCAN_TIMEOUT_MS / 1000}秒（可通过 SCAN_TIMEOUT_MS 环境变量调整）`);
-  console.log(`POST /scan  - 提交 JSON {"image": "镜像名"} 进行扫描`);
-  console.log(`GET  /scan?image=镜像名  - 通过查询参数扫描`);
+  console.log(`POST /scan  - 提交 JSON {"image": "镜像名", "severity": "CRITICAL,HIGH"} 进行扫描`);
+  console.log(`GET  /scan?image=镜像名&severity=CRITICAL,HIGH  - 通过查询参数扫描`);
+  console.log(`       severity 可选值：CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN（逗号分隔多个）`);
   console.log(`GET  /health - 健康检查`);
 });
