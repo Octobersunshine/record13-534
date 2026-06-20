@@ -1,11 +1,26 @@
 const express = require("express");
-const { execFile } = require("child_process");
-const path = require("path");
+const { spawn } = require("child_process");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const SCAN_TIMEOUT_MS = parseInt(process.env.SCAN_TIMEOUT_MS, 10) || 60000;
+
+app.use((req, res, next) => {
+  req._scanTimer = setTimeout(() => {
+    if (!res.headersSent) {
+      res.status(504).json({ success: false, error: `请求超时（${SCAN_TIMEOUT_MS / 1000}秒），可通过环境变量 SCAN_TIMEOUT_MS 调整` });
+    }
+  }, SCAN_TIMEOUT_MS + 5000);
+
+  const origEnd = res.end.bind(res);
+  res.end = function (...args) {
+    clearTimeout(req._scanTimer);
+    origEnd(...args);
+  };
+  next();
+});
 
 function sanitizeImageName(name) {
   if (!name || typeof name !== "string") return null;
@@ -20,34 +35,83 @@ function runTrivy(imageName) {
     const trivyCmd = process.platform === "win32" ? "trivy.exe" : "trivy";
     const args = ["image", "--format", "json", "--no-progress", imageName];
 
-    execFile(trivyCmd, args, { maxBuffer: 50 * 1024 * 1024, timeout: 300000 }, (error, stdout, stderr) => {
-      if (error) {
-        if (error.killed) {
-          return reject(new Error("扫描超时（5分钟限制）"));
-        }
-        const stderrStr = (stderr || "").toString();
-        if (stderrStr.includes("not found") || stderrStr.includes("not recognized")) {
-          return reject(new Error("未找到 Trivy 安全扫描工具，请先安装：https://trivy.dev"));
-        }
-        if (stderrStr.includes("unknown flag")) {
-          return reject(new Error("Trivy 参数不兼容，请检查 Trivy 版本"));
-        }
-        if (stdout) {
-          try {
-            const result = JSON.parse(stdout.toString());
-            return resolve(result);
-          } catch (_) {}
-        }
-        return reject(new Error(`扫描失败：${stderrStr || error.message}`));
+    const child = spawn(trivyCmd, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
       }
-      try {
-        const result = JSON.parse(stdout.toString());
-        resolve(result);
-      } catch (parseErr) {
-        reject(new Error("无法解析 Trivy 扫描结果"));
+    };
+
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(arg);
+    };
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (stdout.length > 100 * 1024 * 1024) {
+        settle(reject, new Error("扫描输出超过 100MB 限制，已终止"));
+        killChild(child);
       }
     });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+
+    child.on("error", (err) => {
+      if (err.code === "ENOENT") {
+        return settle(reject, new Error("未找到 Trivy 安全扫描工具，请先安装：https://trivy.dev"));
+      }
+      settle(reject, new Error(`启动扫描进程失败：${err.message}`));
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+
+      if (code !== 0 && !stdout) {
+        const stderrStr = stderr.toString();
+        if (stderrStr.includes("unknown flag")) {
+          return settle(reject, new Error("Trivy 参数不兼容，请检查 Trivy 版本"));
+        }
+        return settle(reject, new Error(`扫描失败（退出码 ${code}）：${stderrStr}`));
+      }
+
+      try {
+        const result = JSON.parse(stdout.toString());
+        settle(resolve, result);
+      } catch (parseErr) {
+        settle(reject, new Error("无法解析 Trivy 扫描结果"));
+      }
+    });
+
+    timer = setTimeout(() => {
+      killChild(child);
+      settle(reject, new Error(`扫描超时（${SCAN_TIMEOUT_MS / 1000}秒限制），镜像过大或网络较慢，可设置环境变量 SCAN_TIMEOUT_MS 调整`));
+    }, SCAN_TIMEOUT_MS);
   });
+}
+
+function killChild(child) {
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    } else {
+      child.kill("SIGKILL");
+    }
+  } catch (_) {}
 }
 
 function extractVulnerabilities(trivyResult) {
@@ -164,6 +228,7 @@ app.get("/health", (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`镜像安全扫描服务已启动：http://localhost:${PORT}`);
+  console.log(`扫描超时限制：${SCAN_TIMEOUT_MS / 1000}秒（可通过 SCAN_TIMEOUT_MS 环境变量调整）`);
   console.log(`POST /scan  - 提交 JSON {"image": "镜像名"} 进行扫描`);
   console.log(`GET  /scan?image=镜像名  - 通过查询参数扫描`);
   console.log(`GET  /health - 健康检查`);
